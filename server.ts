@@ -554,18 +554,24 @@ const PermissionRequestSchema = z.object({
     description: z.string(),
     input_preview: z.string(),
   }),
-})
+}) as any // zod v3/v4 type recursion workaround (TS2589)
 
-mcp.setNotificationHandler(PermissionRequestSchema, async ({ params }) => {
+mcp.setNotificationHandler(PermissionRequestSchema, async ({ params }: { params: { request_id: string; tool_name: string; description: string; input_preview: string } }) => {
   // Find where to post — last active channel, or first opted-in channel
   const access = getAccess()
   const targetChannel = lastActiveChannel || Object.keys(access.channels || {})[0]
   if (!targetChannel) return
 
+  assertOutboundAllowed(targetChannel)
+
+  // Escape mrkdwn to prevent injection via tool_name/description
+  const safeTool = params.tool_name.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+  const safeDesc = params.description.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+
   await web.chat.postMessage({
     channel: targetChannel,
     text:
-      `🟡 *${params.tool_name}*: ${params.description}\n` +
+      `🟡 *${safeTool}*: ${safeDesc}\n` +
       `Reply \`y ${params.request_id}\` or \`n ${params.request_id}\``,
     thread_ts: lastActiveThread,
     unfurl_links: false,
@@ -616,7 +622,7 @@ async function handleMessage(event: unknown): Promise<void> {
       // Check for permission reply before normal delivery
       const msgText = ((ev['text'] as string) || '').trim()
       const permMatch = PERMISSION_REPLY_RE.exec(msgText)
-      if (permMatch) {
+      if (permMatch && result.access!.allowFrom.includes(ev['user'] as string)) {
         await mcp.notification({
           method: 'notifications/claude/channel/permission',
           params: {
@@ -624,7 +630,7 @@ async function handleMessage(event: unknown): Promise<void> {
             behavior: permMatch[1].toLowerCase().startsWith('y') ? 'allow' : 'deny',
           },
         })
-        // Ack with a reaction so Sam knows it was processed
+        // Ack with a reaction so the user knows it was processed
         try {
           await web.reactions.add({
             channel: channelId,
