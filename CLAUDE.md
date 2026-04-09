@@ -25,9 +25,17 @@ bun install              # Install deps
 bun run typecheck        # TypeScript strict check (tsc --noEmit)
 bun test                 # Run test suite (bun:test)
 bun test --watch         # Watch mode
+bun test --grep "gate"   # Run tests matching a pattern
 bun server.ts            # Run server directly
 npx tsx server.ts        # Node.js fallback
 ```
+
+Dev mode (bypasses plugin allowlist):
+```bash
+claude --dangerously-load-development-channels server:slack
+```
+
+CI runs typecheck + tests on every push to main and every PR (`.github/workflows/ci.yml`).
 
 ## Key Files
 
