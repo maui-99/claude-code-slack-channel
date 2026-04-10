@@ -141,9 +141,13 @@ function loadAccess(): Access {
 }
 
 function saveAccess(access: Access): void {
-  const tmp = ACCESS_FILE + '.tmp'
-  writeFileSync(tmp, JSON.stringify(access, null, 2), 'utf-8')
-  chmodSync(tmp, 0o600)
+  // Use a pid-qualified tmp name so concurrent writers (shouldn't happen,
+  // but defense in depth) don't collide, and pass mode: 0o600 directly to
+  // writeFileSync so the file is created with the correct permissions
+  // atomically. The previous two-step writeFileSync + chmodSync left a
+  // window where the tmp file was world-readable under the process umask.
+  const tmp = `${ACCESS_FILE}.tmp.${process.pid}`
+  writeFileSync(tmp, JSON.stringify(access, null, 2), { mode: 0o600, flag: 'w' })
   renameSync(tmp, ACCESS_FILE)
 }
 
