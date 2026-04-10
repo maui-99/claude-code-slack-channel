@@ -4,6 +4,7 @@ import {
   assertSendable,
   parseSendableRoots,
   assertOutboundAllowed,
+  isSlackFileUrl,
   chunkText,
   sanitizeFilename,
   defaultAccess,
@@ -471,6 +472,95 @@ describe('assertOutboundAllowed', () => {
     })
     const delivered = new Set(['D_DIFFERENT'])
     expect(() => assertOutboundAllowed('C_ATTACKER', access, delivered)).toThrow('Outbound gate')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// isSlackFileUrl() — gate for download_attachment
+// ---------------------------------------------------------------------------
+
+describe('isSlackFileUrl', () => {
+  test('accepts canonical files.slack.com https URL', () => {
+    expect(
+      isSlackFileUrl('https://files.slack.com/files-pri/T123-F456/image.png'),
+    ).toBe(true)
+  })
+
+  test('rejects http (no TLS)', () => {
+    expect(
+      isSlackFileUrl('http://files.slack.com/files-pri/T123-F456/image.png'),
+    ).toBe(false)
+  })
+
+  test('rejects other Slack subdomains', () => {
+    expect(isSlackFileUrl('https://slack.com/api/files.info')).toBe(false)
+    expect(isSlackFileUrl('https://app.slack.com/files/...')).toBe(false)
+  })
+
+  test('rejects attacker-controlled host that embeds files.slack.com', () => {
+    expect(
+      isSlackFileUrl('https://files.slack.com.attacker.example/steal'),
+    ).toBe(false)
+    expect(
+      isSlackFileUrl('https://attacker.example/?files.slack.com'),
+    ).toBe(false)
+  })
+
+  test('rejects malformed URLs', () => {
+    expect(isSlackFileUrl('not-a-url')).toBe(false)
+    expect(isSlackFileUrl('')).toBe(false)
+    expect(isSlackFileUrl(null as any)).toBe(false)
+    expect(isSlackFileUrl(undefined as any)).toBe(false)
+  })
+
+  test('rejects file:// URLs', () => {
+    expect(isSlackFileUrl('file:///etc/passwd')).toBe(false)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Tool handler outbound gate smoke tests
+// ---------------------------------------------------------------------------
+//
+// The reply / react / edit_message / fetch_messages / download_attachment
+// handlers are inlined in server.ts and call assertOutboundAllowed() directly.
+// We don't import server.ts here (it has side-effectful bootstrap). Instead
+// we verify the library-level gate behaves correctly for each chat_id
+// argument, which is all those handlers delegate to.
+
+describe('outbound gate coverage for read/edit/react/download', () => {
+  test('blocks react on unknown channel', () => {
+    const access = makeAccess()
+    expect(() =>
+      assertOutboundAllowed('C_RANDOM', access, new Set()),
+    ).toThrow('Outbound gate')
+  })
+
+  test('blocks edit_message on unknown channel', () => {
+    const access = makeAccess()
+    expect(() =>
+      assertOutboundAllowed('C_RANDOM', access, new Set()),
+    ).toThrow('Outbound gate')
+  })
+
+  test('blocks fetch_messages on unknown channel', () => {
+    const access = makeAccess()
+    expect(() =>
+      assertOutboundAllowed('C_RANDOM', access, new Set()),
+    ).toThrow('Outbound gate')
+  })
+
+  test('blocks download_attachment on unknown channel', () => {
+    const access = makeAccess()
+    expect(() =>
+      assertOutboundAllowed('C_RANDOM', access, new Set()),
+    ).toThrow('Outbound gate')
+  })
+
+  test('allows these calls on a delivered DM channel', () => {
+    const access = makeAccess()
+    const delivered = new Set(['D_ALICE'])
+    expect(() => assertOutboundAllowed('D_ALICE', access, delivered)).not.toThrow()
   })
 })
 

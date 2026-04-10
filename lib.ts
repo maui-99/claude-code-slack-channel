@@ -268,6 +268,27 @@ export function assertOutboundAllowed(
   )
 }
 
+/**
+ * Returns true if `url` is a well-formed https URL on files.slack.com.
+ *
+ * Used before attaching the bot token to a fetch() of a Slack file URL.
+ * Any other host (including subdomains like evil.files.slack.com.attacker,
+ * http://, or malformed URLs) is rejected so a crafted file.url_private
+ * cannot exfiltrate the token.
+ */
+export function isSlackFileUrl(url: unknown): boolean {
+  if (typeof url !== 'string' || url.length === 0) return false
+  let parsed: URL
+  try {
+    parsed = new URL(url)
+  } catch {
+    return false
+  }
+  if (parsed.protocol !== 'https:') return false
+  if (parsed.hostname !== 'files.slack.com') return false
+  return true
+}
+
 // ---------------------------------------------------------------------------
 // Text chunking
 // ---------------------------------------------------------------------------

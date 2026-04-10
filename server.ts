@@ -34,6 +34,7 @@ import {
   assertSendable as libAssertSendable,
   parseSendableRoots,
   assertOutboundAllowed as libAssertOutboundAllowed,
+  isSlackFileUrl,
   chunkText,
   sanitizeFilename,
   gate as libGate,
@@ -419,6 +420,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
     // react
     // -----------------------------------------------------------------------
     case 'react': {
+      assertOutboundAllowed(args.chat_id)
       await web.reactions.add({
         channel: args.chat_id,
         timestamp: args.message_id,
@@ -433,6 +435,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
     // edit_message
     // -----------------------------------------------------------------------
     case 'edit_message': {
+      assertOutboundAllowed(args.chat_id)
       await web.chat.update({
         channel: args.chat_id,
         ts: args.message_id,
@@ -448,6 +451,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
     // -----------------------------------------------------------------------
     case 'fetch_messages': {
       const channel: string = args.channel
+      assertOutboundAllowed(channel)
       const limit = Math.min(args.limit || 20, 100)
       const threadTs: string | undefined = args.thread_ts
 
@@ -497,6 +501,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
       const channel: string = args.chat_id
       const messageTs: string = args.message_id
 
+      assertOutboundAllowed(channel)
+
       // Fetch the specific message to get file info
       const res = await web.conversations.replies({
         channel,
@@ -514,6 +520,13 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
       for (const file of msg.files) {
         const url = file.url_private_download || file.url_private
         if (!url) continue
+
+        // Validate that the URL host is exactly files.slack.com over https
+        // before we attach the bot token. Slack's file URLs always live on
+        // that host; anything else is either Slack API tampering or a
+        // crafted file entry trying to exfil the token to an
+        // attacker-controlled endpoint.
+        if (!isSlackFileUrl(url)) continue
 
         const safeName = sanitizeFilename(file.name || `file_${Date.now()}`)
         const outPath = join(INBOX_DIR, `${messageTs.replace('.', '_')}_${safeName}`)
