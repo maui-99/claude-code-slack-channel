@@ -709,8 +709,8 @@ describe('generateCode', () => {
 // ---------------------------------------------------------------------------
 
 describe('defaultAccess', () => {
-  test('returns pairing policy by default', () => {
-    expect(defaultAccess().dmPolicy).toBe('pairing')
+  test('returns allowlist policy by default (hardened fork)', () => {
+    expect(defaultAccess().dmPolicy).toBe('allowlist')
   })
 
   test('returns empty allowlist', () => {
