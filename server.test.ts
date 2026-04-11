@@ -11,11 +11,15 @@ import {
   defaultAccess,
   pruneExpired,
   generateCode,
+  ReliableNotifier,
   MAX_PENDING,
   MAX_PAIRING_REPLIES,
   PAIRING_EXPIRY_MS,
+  RELIABLE_RETRY_DELAY_MS,
+  RELIABLE_MAX_ATTEMPTS,
   type Access,
   type GateOptions,
+  type ReliableScheduler,
 } from './lib.ts'
 import {
   mkdtempSync,
@@ -796,5 +800,217 @@ describe('defaultAccess', () => {
 
   test('returns empty pending', () => {
     expect(defaultAccess().pending).toEqual({})
+  })
+})
+
+// ---------------------------------------------------------------------------
+// ReliableNotifier — fire-and-forget retry wrapper
+// ---------------------------------------------------------------------------
+
+/**
+ * Test-only fake scheduler that lets a test synchronously advance virtual
+ * time, without touching the real event loop. Matches the ReliableScheduler
+ * interface so it can be injected in place of { setTimeout, clearTimeout }.
+ */
+function makeFakeScheduler() {
+  let now = 0
+  let nextHandle = 1
+  const timers = new Map<number, { fireAt: number; fn: () => void }>()
+
+  const scheduler: ReliableScheduler = {
+    setTimeout: (fn: () => void, ms: number): number => {
+      const handle = nextHandle++
+      timers.set(handle, { fireAt: now + ms, fn })
+      return handle
+    },
+    clearTimeout: (handle: number | undefined): void => {
+      if (handle !== undefined) timers.delete(handle)
+    },
+  }
+
+  return {
+    scheduler,
+    advance(ms: number) {
+      now += ms
+      // Fire any timers that are due, in insertion order. A timer's fn may
+      // enqueue new timers; those are considered for later advance() calls.
+      const due: Array<[number, () => void]> = []
+      for (const [handle, entry] of timers) {
+        if (entry.fireAt <= now) due.push([handle, entry.fn])
+      }
+      for (const [handle, fn] of due) {
+        timers.delete(handle)
+        fn()
+      }
+    },
+    pendingCount() {
+      return timers.size
+    },
+  }
+}
+
+describe('ReliableNotifier', () => {
+  test('sends the notification once on schedule()', () => {
+    const fake = makeFakeScheduler()
+    const calls: string[] = []
+    const notifier = new ReliableNotifier({
+      scheduler: fake.scheduler,
+      log: () => {},
+    })
+    notifier.schedule('msg-1', () => {
+      calls.push('send')
+    })
+    expect(calls).toEqual(['send'])
+  })
+
+  test('retries after RELIABLE_RETRY_DELAY_MS if not acked', () => {
+    const fake = makeFakeScheduler()
+    const calls: string[] = []
+    const notifier = new ReliableNotifier({
+      scheduler: fake.scheduler,
+      log: () => {},
+    })
+    notifier.schedule('msg-1', () => {
+      calls.push('send')
+    })
+    expect(calls.length).toBe(1)
+    fake.advance(RELIABLE_RETRY_DELAY_MS)
+    expect(calls.length).toBe(2)
+    fake.advance(RELIABLE_RETRY_DELAY_MS)
+    expect(calls.length).toBe(3)
+  })
+
+  test('caps total attempts at RELIABLE_MAX_ATTEMPTS', () => {
+    const fake = makeFakeScheduler()
+    let sends = 0
+    const notifier = new ReliableNotifier({
+      scheduler: fake.scheduler,
+      log: () => {},
+    })
+    notifier.schedule('msg-1', () => {
+      sends++
+    })
+    // Advance far beyond the max attempt budget
+    for (let i = 0; i < 10; i++) {
+      fake.advance(RELIABLE_RETRY_DELAY_MS)
+    }
+    expect(sends).toBe(RELIABLE_MAX_ATTEMPTS)
+    expect(fake.pendingCount()).toBe(0)
+  })
+
+  test('ack() cancels pending retries for all in-flight messages', () => {
+    const fake = makeFakeScheduler()
+    let sends = 0
+    const notifier = new ReliableNotifier({
+      scheduler: fake.scheduler,
+      log: () => {},
+    })
+    notifier.schedule('msg-1', () => {
+      sends++
+    })
+    notifier.schedule('msg-2', () => {
+      sends++
+    })
+    expect(sends).toBe(2) // two initial sends
+    notifier.ack()
+    fake.advance(RELIABLE_RETRY_DELAY_MS * 10)
+    expect(sends).toBe(2) // no retries fired
+    expect(fake.pendingCount()).toBe(0)
+  })
+
+  test('cancel(messageId) cancels retries only for that message', () => {
+    const fake = makeFakeScheduler()
+    const sends: string[] = []
+    const notifier = new ReliableNotifier({
+      scheduler: fake.scheduler,
+      log: () => {},
+    })
+    notifier.schedule('msg-1', () => {
+      sends.push('msg-1')
+    })
+    notifier.schedule('msg-2', () => {
+      sends.push('msg-2')
+    })
+    expect(sends).toEqual(['msg-1', 'msg-2'])
+    notifier.cancel('msg-1')
+    fake.advance(RELIABLE_RETRY_DELAY_MS)
+    expect(sends).toEqual(['msg-1', 'msg-2', 'msg-2'])
+    fake.advance(RELIABLE_RETRY_DELAY_MS)
+    expect(sends).toEqual(['msg-1', 'msg-2', 'msg-2', 'msg-2'])
+  })
+
+  test('schedule() with the same messageId replaces the prior in-flight entry', () => {
+    const fake = makeFakeScheduler()
+    let sends = 0
+    const notifier = new ReliableNotifier({
+      scheduler: fake.scheduler,
+      log: () => {},
+    })
+    notifier.schedule('msg-1', () => {
+      sends++
+    })
+    expect(sends).toBe(1)
+    // Re-scheduling the same messageId must not double the retry budget:
+    // the old timer is cleared and a fresh attempt sequence starts.
+    notifier.schedule('msg-1', () => {
+      sends++
+    })
+    expect(sends).toBe(2)
+    // One retry sequence should still run from the latest schedule call.
+    fake.advance(RELIABLE_RETRY_DELAY_MS)
+    expect(sends).toBe(3)
+    fake.advance(RELIABLE_RETRY_DELAY_MS)
+    expect(sends).toBe(RELIABLE_MAX_ATTEMPTS + 1) // first attempt + full retry sequence from replacement
+  })
+
+  test('ack() before the first retry fires prevents any retry', () => {
+    const fake = makeFakeScheduler()
+    let sends = 0
+    const notifier = new ReliableNotifier({
+      scheduler: fake.scheduler,
+      log: () => {},
+    })
+    notifier.schedule('msg-1', () => {
+      sends++
+    })
+    // Half the delay — not due yet
+    fake.advance(RELIABLE_RETRY_DELAY_MS / 2)
+    notifier.ack()
+    fake.advance(RELIABLE_RETRY_DELAY_MS * 10)
+    expect(sends).toBe(1)
+  })
+
+  test('logs attempt numbers via the injected log hook', () => {
+    const fake = makeFakeScheduler()
+    const logs: string[] = []
+    const notifier = new ReliableNotifier({
+      scheduler: fake.scheduler,
+      log: (msg) => logs.push(msg),
+    })
+    notifier.schedule('msg-1', () => {})
+    expect(logs.some((l) => l.includes(`1/${RELIABLE_MAX_ATTEMPTS}`))).toBe(true)
+    fake.advance(RELIABLE_RETRY_DELAY_MS)
+    expect(logs.some((l) => l.includes(`2/${RELIABLE_MAX_ATTEMPTS}`))).toBe(true)
+    fake.advance(RELIABLE_RETRY_DELAY_MS)
+    expect(logs.some((l) => l.includes(`3/${RELIABLE_MAX_ATTEMPTS}`))).toBe(true)
+  })
+
+  test('sender throwing does not crash subsequent attempts', () => {
+    const fake = makeFakeScheduler()
+    let sends = 0
+    const notifier = new ReliableNotifier({
+      scheduler: fake.scheduler,
+      log: () => {},
+    })
+    notifier.schedule('msg-1', () => {
+      sends++
+      throw new Error('boom')
+    })
+    // First attempt ran and threw — schedule() must have caught and armed a retry
+    expect(sends).toBe(1)
+    fake.advance(RELIABLE_RETRY_DELAY_MS)
+    expect(sends).toBe(2)
+    fake.advance(RELIABLE_RETRY_DELAY_MS)
+    expect(sends).toBe(3)
   })
 })

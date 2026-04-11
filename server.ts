@@ -39,6 +39,7 @@ import {
   sanitizeFilename,
   sanitizeDisplayName,
   gate as libGate,
+  ReliableNotifier,
   type Access,
   type GateResult,
 } from './lib.ts'
@@ -272,6 +273,23 @@ const mcp = new Server(
 )
 
 // ---------------------------------------------------------------------------
+// Reliability — retry wrapper for inbound channel notifications
+// ---------------------------------------------------------------------------
+//
+// Claude Code's MCP notification handler silently drops notifications that
+// arrive while the session's turn loop is between readline polls, so a
+// single fire-and-forget `mcp.notification(...)` is unreliable: the first
+// Slack DM after an idle period often fails to wake up Claude, and the user
+// has to resend 2-3 times. See lib.ts:ReliableNotifier for the full design.
+//
+// We re-send with an 800ms backoff up to 3 attempts. Any inbound CallTool
+// request from Claude Code proves the turn loop is running and cancels all
+// pending retries (see the CallToolRequestSchema handler below).
+const reliableNotifier = new ReliableNotifier({
+  log: (msg: string) => console.error(msg),
+})
+
+// ---------------------------------------------------------------------------
 // Tools — definition
 // ---------------------------------------------------------------------------
 
@@ -372,6 +390,13 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
 // ---------------------------------------------------------------------------
 
 mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
+  // Any tool call proves Claude Code's turn loop is running — clear pending
+  // retries for all in-flight channel notifications. This is the ack signal
+  // for reliableNotifier.schedule() calls in handleMessage below. Must be
+  // the very first line of this handler so ack fires before any tool work
+  // (including argument validation / throws) can short-circuit it.
+  reliableNotifier.ack()
+
   const { name } = request.params
   const args = (request.params.arguments || {}) as Record<string, any>
 
@@ -950,10 +975,17 @@ async function handleMessage(event: unknown): Promise<void> {
         text = text.replace(new RegExp(`<@${botUserId}>\\s*`, 'g'), '').trim()
       }
 
-      // Push into Claude Code session via MCP notification
-      mcp.notification({
-        method: 'notifications/claude/channel',
-        params: { content: text, meta },
+      // Push into Claude Code session via MCP notification. Wrapped in the
+      // reliableNotifier retry loop because the raw notification is
+      // fire-and-forget and is sometimes dropped when Claude Code's turn
+      // loop is between readline polls. The slack `ts` serves as the
+      // message_id for retry bookkeeping (guaranteed unique per message).
+      const slackTs = (ev['ts'] as string) || `fallback.${Date.now()}`
+      reliableNotifier.schedule(slackTs, () => {
+        mcp.notification({
+          method: 'notifications/claude/channel',
+          params: { content: text, meta },
+        })
       })
     }
   }

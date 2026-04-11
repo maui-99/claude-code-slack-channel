@@ -19,6 +19,14 @@ export const MAX_PENDING = 3
 export const MAX_PAIRING_REPLIES = 2
 export const PAIRING_EXPIRY_MS = 60 * 60 * 1000 // 1 hour
 
+// Reliability retry wrapper around MCP notifications. Claude Code's MCP
+// notification handler silently drops notifications when the turn loop is
+// between readline polls, so a single fire-and-forget notification is
+// unreliable. We re-send with a short backoff until any outbound tool call
+// from Claude Code proves the turn is running. See ReliableNotifier below.
+export const RELIABLE_RETRY_DELAY_MS = 800
+export const RELIABLE_MAX_ATTEMPTS = 3
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -453,4 +461,150 @@ function isMentioned(event: Record<string, unknown>, botUserId: string): boolean
   if (!botUserId) return false
   const text = (event['text'] as string | undefined) || ''
   return text.includes(`<@${botUserId}>`)
+}
+
+// ---------------------------------------------------------------------------
+// ReliableNotifier — retry wrapper around fire-and-forget MCP notifications
+// ---------------------------------------------------------------------------
+
+/**
+ * Scheduler shim so the notifier can be driven by a fake clock in tests.
+ * Node's global setTimeout/clearTimeout satisfy this shape (the handle type
+ * is opaque — we pass whatever setTimeout returns straight back to clearTimeout).
+ */
+export interface ReliableScheduler {
+  setTimeout: (fn: () => void, ms: number) => any
+  clearTimeout: (handle: any) => void
+}
+
+export interface ReliableNotifierOptions {
+  scheduler?: ReliableScheduler
+  log?: (msg: string) => void
+  retryDelayMs?: number
+  maxAttempts?: number
+}
+
+interface InFlight {
+  send: () => void
+  attempt: number
+  timer: any
+}
+
+/**
+ * Retry wrapper for `mcp.notification({method:'notifications/claude/channel',...})`.
+ *
+ * Claude Code's notification handler drops inbound notifications if they land
+ * while the session is between readline polls, and the SDK gives the sender
+ * no ack signal. The symptom is that the first Slack DM after an idle period
+ * often fails to start a Claude turn, and the user has to send the same
+ * message 2-3 times before Claude wakes up.
+ *
+ * Strategy:
+ *   - schedule(messageId, send) calls send() immediately, then arms a timer
+ *     to re-send after retryDelayMs. Up to maxAttempts total sends.
+ *   - ack() is called when the server observes ANY CallTool request from
+ *     Claude Code (the turn is demonstrably running), and cancels ALL
+ *     in-flight retries. This is the best ack signal we have short of
+ *     an explicit protocol change.
+ *   - cancel(messageId) allows targeted cancellation if we ever get a
+ *     per-message ack channel.
+ *
+ * Idempotency note: if Claude Code DOES process the first notification but
+ * the turn is slow to start AND the turn doesn't emit a tool call within
+ * retryDelayMs, a duplicate turn is possible. The observed failure mode
+ * ("send it 2-3 times") is worse than occasional duplicates, so we accept
+ * that risk. Most turns call `reply` within well under 800ms, which clears
+ * the retry.
+ *
+ * This class is deliberately side-effect-free beyond the injected scheduler
+ * and log hook so it is fully testable from server.test.ts without touching
+ * real timers or MCP state.
+ */
+export class ReliableNotifier {
+  private readonly scheduler: ReliableScheduler
+  private readonly log: (msg: string) => void
+  private readonly retryDelayMs: number
+  private readonly maxAttempts: number
+  private readonly inFlight = new Map<string, InFlight>()
+
+  constructor(opts: ReliableNotifierOptions = {}) {
+    this.scheduler = opts.scheduler ?? {
+      setTimeout: (fn, ms) => setTimeout(fn, ms),
+      clearTimeout: (handle) => clearTimeout(handle),
+    }
+    this.log = opts.log ?? (() => {})
+    this.retryDelayMs = opts.retryDelayMs ?? RELIABLE_RETRY_DELAY_MS
+    this.maxAttempts = opts.maxAttempts ?? RELIABLE_MAX_ATTEMPTS
+  }
+
+  /**
+   * Deliver `send` now and arm retries under the given messageId. If an entry
+   * already exists for messageId, it is cancelled and fully replaced (the
+   * retry budget resets). `send` may throw; the exception is caught and
+   * logged so a transient send failure does not break retry scheduling.
+   */
+  schedule(messageId: string, send: () => void): void {
+    // Replace any pre-existing entry for this messageId
+    const existing = this.inFlight.get(messageId)
+    if (existing) {
+      this.scheduler.clearTimeout(existing.timer)
+      this.inFlight.delete(messageId)
+    }
+
+    const entry: InFlight = { send, attempt: 0, timer: undefined }
+    this.inFlight.set(messageId, entry)
+    this.fire(messageId, entry)
+  }
+
+  /**
+   * Cancel the retry loop for a specific messageId. Called when we know a
+   * particular notification has been processed (not currently used — we rely
+   * on the broader ack() — but kept for future per-message ack channels).
+   */
+  cancel(messageId: string): void {
+    const entry = this.inFlight.get(messageId)
+    if (!entry) return
+    this.scheduler.clearTimeout(entry.timer)
+    this.inFlight.delete(messageId)
+  }
+
+  /**
+   * Cancel ALL retry loops. Called from the MCP CallTool request handler as
+   * soon as any tool call arrives from Claude Code — that proves the turn
+   * loop is running and no further retries are useful.
+   */
+  ack(): void {
+    for (const [, entry] of this.inFlight) {
+      this.scheduler.clearTimeout(entry.timer)
+    }
+    this.inFlight.clear()
+  }
+
+  /**
+   * Fire one attempt and, if more are budgeted, arm the next retry timer.
+   */
+  private fire(messageId: string, entry: InFlight): void {
+    entry.attempt++
+    this.log(`[slack] delivery attempt ${entry.attempt}/${this.maxAttempts} (msg=${messageId})`)
+    try {
+      entry.send()
+    } catch (err) {
+      this.log(`[slack] delivery attempt ${entry.attempt}/${this.maxAttempts} threw: ${err}`)
+    }
+
+    if (entry.attempt >= this.maxAttempts) {
+      // Budget exhausted — drop the entry so ack() / cancel() don't hold
+      // dead state.
+      this.inFlight.delete(messageId)
+      return
+    }
+
+    entry.timer = this.scheduler.setTimeout(() => {
+      // The entry may have been cancelled between setTimeout and fire.
+      // Re-look-up by id so stale timers don't resurrect cancelled entries.
+      const current = this.inFlight.get(messageId)
+      if (!current || current !== entry) return
+      this.fire(messageId, entry)
+    }, this.retryDelayMs)
+  }
 }
