@@ -190,6 +190,25 @@ function assertSendable(filePath: string): void {
 // Track channels that passed inbound gate (session-lifetime cache)
 const deliveredChannels = new Set<string>()
 
+// Message deduplication — Socket Mode can deliver the same event multiple
+// times (reconnection replay, retry on slow ack, or library-level dup).
+// Track recently-seen event timestamps and drop duplicates silently.
+const DEDUP_WINDOW_MS = 60_000
+const seenMessages = new Map<string, number>() // ts -> received_at
+
+function isDuplicateMessage(ts: string): boolean {
+  const now = Date.now()
+  // Prune stale entries
+  if (seenMessages.size > 200) {
+    for (const [key, time] of seenMessages) {
+      if (now - time > DEDUP_WINDOW_MS) seenMessages.delete(key)
+    }
+  }
+  if (seenMessages.has(ts)) return true
+  seenMessages.set(ts, now)
+  return false
+}
+
 // Track last active channel/thread for permission relay
 let lastActiveChannel = ''
 let lastActiveThread: string | undefined
@@ -854,9 +873,12 @@ const PERMISSION_REPLY_RE = /^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$/i
 // ---------------------------------------------------------------------------
 
 async function handleMessage(event: unknown): Promise<void> {
-  const result = await gate(event)
-
+  // Dedup: Socket Mode can deliver the same event multiple times
   const ev = event as Record<string, unknown>
+  const msgTs = ev['ts'] as string | undefined
+  if (msgTs && isDuplicateMessage(msgTs)) return
+
+  const result = await gate(event)
 
   switch (result.action) {
     case 'drop':
