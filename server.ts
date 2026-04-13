@@ -695,26 +695,39 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       try {
-        // Get API token
+        // Get API token (10s timeout)
         const tokenRes = await fetch(`${lookerBase}/api/4.0/login`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
           body: `client_id=${encodeURIComponent(lookerClientId)}&client_secret=${encodeURIComponent(lookerClientSecret)}`,
+          signal: AbortSignal.timeout(10_000),
         })
         if (!tokenRes.ok) throw new Error(`Looker auth failed: ${tokenRes.status}`)
         const tokenData = await tokenRes.json() as { access_token: string }
         const token = tokenData.access_token
+        if (!token) throw new Error('Looker auth returned no access_token')
 
         let apiUrl: string
         switch (action) {
-          case 'explore': apiUrl = `${lookerBase}/api/4.0/lookml_models/explores/${encodeURIComponent(id)}`; break
+          case 'explore': {
+            // Explore ID format: "model_name/explore_name" or just "explore_name"
+            // API requires: /lookml_models/{model}/explores/{explore}
+            const parts = id.includes('/') ? id.split('/') : ['', id]
+            if (parts.length === 2 && parts[0]) {
+              apiUrl = `${lookerBase}/api/4.0/lookml_models/${encodeURIComponent(parts[0])}/explores/${encodeURIComponent(parts[1])}`
+            } else {
+              // If no model specified, search all models
+              apiUrl = `${lookerBase}/api/4.0/lookml_models?fields=name,explores`
+            }
+            break
+          }
           case 'look': apiUrl = `${lookerBase}/api/4.0/looks/${encodeURIComponent(id)}`; break
           case 'dashboard': apiUrl = `${lookerBase}/api/4.0/dashboards/${encodeURIComponent(id)}`; break
           case 'sql_runner': apiUrl = `${lookerBase}/api/4.0/sql_queries/${encodeURIComponent(id)}`; break
           default: return { content: [{ type: 'text', text: `Unknown Looker action: ${action}` }], isError: true }
         }
 
-        const res = await fetch(apiUrl, { headers: { Authorization: `Bearer ${token}` }, redirect: 'manual' })
+        const res = await fetch(apiUrl, { headers: { Authorization: `Bearer ${token}` }, redirect: 'manual', signal: AbortSignal.timeout(15_000) })
         if (res.status >= 300 && res.status < 400) throw new Error(`Looker API redirected — not following`)
         if (!res.ok) throw new Error(`Looker API ${res.status}`)
         const contentLength = parseInt(res.headers.get('content-length') || '0', 10)
@@ -785,7 +798,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
           }
         }
 
-        const res = await fetch(fetchUrl, { redirect: 'manual' })
+        const res = await fetch(fetchUrl, { redirect: 'manual', signal: AbortSignal.timeout(15_000) })
         if (res.status >= 300 && res.status < 400) {
           const location = res.headers.get('location') || ''
           // Re-validate redirect target against allowlist
@@ -807,6 +820,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
         const contentLength = parseInt(res.headers.get('content-length') || '0', 10)
         if (contentLength > 500_000) throw new Error(`Response too large: ${contentLength} bytes`)
         const text = await res.text()
+        // Detect Google Docs auth wall (returns HTML login page instead of doc content)
+        if (parsedUrl.hostname === 'docs.google.com' && (text.includes('accounts.google.com') || text.includes('ServiceLogin'))) {
+          return { content: [{ type: 'text', text: 'This Google Doc requires authentication. It may be restricted to the organization. Please either share it with "Anyone with the link" or paste the content directly.' }], isError: true }
+        }
         return { content: [{ type: 'text', text: text.slice(0, 8000) }] }
       } catch (err: any) {
         return { content: [{ type: 'text', text: `Fetch error: ${err.message}` }], isError: true }
