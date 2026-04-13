@@ -22,6 +22,7 @@ import { join, resolve } from 'path'
 import {
   readFileSync,
   writeFileSync,
+  appendFileSync,
   mkdirSync,
   chmodSync,
   existsSync,
@@ -212,6 +213,27 @@ function isDuplicateMessage(ts: string): boolean {
 // Track last active channel/thread for permission relay
 let lastActiveChannel = ''
 let lastActiveThread: string | undefined
+
+// Structured Q&A logging for the feedback loop. Captures the last inbound
+// question so it can be paired with the reply when the reply tool fires.
+let lastInboundQuestion: { text: string; userId: string; userName: string; chatId: string; ts: string } | null = null
+const QA_LOG_PATH = process.env['ALFRED_QA_LOG'] || join(homedir(), 'alfred-slack-session', 'qa-log.jsonl')
+
+function logQA(question: typeof lastInboundQuestion, answer: string, chatId: string): void {
+  if (!question) return
+  try {
+    const entry = JSON.stringify({
+      ts: new Date().toISOString(),
+      question_ts: question.ts,
+      user_id: question.userId,
+      user_name: question.userName,
+      chat_id: chatId,
+      question: question.text,
+      answer: answer.slice(0, 2000), // cap to avoid huge log lines
+    })
+    appendFileSync(QA_LOG_PATH, entry + '\n', { mode: 0o600 })
+  } catch { /* non-critical — don't break replies if logging fails */ }
+}
 
 function assertOutboundAllowed(chatId: string): void {
   libAssertOutboundAllowed(chatId, getAccess(), deliveredChannels)
@@ -452,6 +474,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
         })
         lastTs = (res.ts as string) || lastTs
       }
+
+      // Log Q&A pair for the feedback loop
+      logQA(lastInboundQuestion, text, chatId)
 
       // Upload files if provided
       if (files && files.length > 0) {
@@ -911,6 +936,18 @@ async function handleMessage(event: unknown): Promise<void> {
       // Track last active channel for permission relay
       lastActiveChannel = channelId
       lastActiveThread = ev['thread_ts'] as string | undefined
+
+      // Capture inbound question for Q&A logging
+      const inboundText = ((ev['text'] as string) || '').trim()
+      if (inboundText) {
+        lastInboundQuestion = {
+          text: inboundText,
+          userId: (ev['user'] as string) || '',
+          userName: await resolveUserName((ev['user'] as string) || ''),
+          chatId: channelId,
+          ts: (ev['ts'] as string) || '',
+        }
+      }
 
       // Check for permission reply before normal delivery
       const msgText = ((ev['text'] as string) || '').trim()
