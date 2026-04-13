@@ -12,6 +12,12 @@ import {
   pruneExpired,
   generateCode,
   ReliableNotifier,
+  parseLookerEnv,
+  buildLookerApiUrl,
+  validateAllowedUrl,
+  convertGoogleDocsUrl,
+  extractConfluencePageId,
+  detectGoogleAuthWall,
   MAX_PENDING,
   MAX_PAIRING_REPLIES,
   PAIRING_EXPIRY_MS,
@@ -1012,5 +1018,157 @@ describe('ReliableNotifier', () => {
     expect(sends).toBe(2)
     fake.advance(RELIABLE_RETRY_DELAY_MS)
     expect(sends).toBe(3)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// buildLookerApiUrl()
+// ---------------------------------------------------------------------------
+
+describe('buildLookerApiUrl', () => {
+  const base = 'https://my.looker.com'
+
+  test('explore with model/name', () => {
+    expect(buildLookerApiUrl(base, 'explore', 'my_model/my_explore')).toBe(
+      'https://my.looker.com/api/4.0/lookml_models/my_model/explores/my_explore',
+    )
+  })
+
+  test('explore without model returns models listing endpoint', () => {
+    expect(buildLookerApiUrl(base, 'explore', 'just_explore')).toBe(
+      'https://my.looker.com/api/4.0/lookml_models?fields=name,explores',
+    )
+  })
+
+  test('look by numeric ID', () => {
+    expect(buildLookerApiUrl(base, 'look', '42')).toBe(
+      'https://my.looker.com/api/4.0/looks/42',
+    )
+  })
+
+  test('dashboard by numeric ID', () => {
+    expect(buildLookerApiUrl(base, 'dashboard', '7')).toBe(
+      'https://my.looker.com/api/4.0/dashboards/7',
+    )
+  })
+})
+
+// ---------------------------------------------------------------------------
+// validateAllowedUrl()
+// ---------------------------------------------------------------------------
+
+describe('validateAllowedUrl', () => {
+  const domains = ['docs.google.com', 'varsity.atlassian.net']
+
+  test('allows docs.google.com', () => {
+    expect(validateAllowedUrl('https://docs.google.com/document/d/abc123', domains)).toBeNull()
+  })
+
+  test('allows varsity.atlassian.net', () => {
+    expect(validateAllowedUrl('https://varsity.atlassian.net/wiki/spaces/X/pages/123', domains)).toBeNull()
+  })
+
+  test('rejects evil.com', () => {
+    const result = validateAllowedUrl('https://evil.com/steal', domains)
+    expect(result).not.toBeNull()
+    expect(result).toContain('not allowed')
+  })
+
+  test('rejects subdomain trick (evil.docs.google.com)', () => {
+    // evil.docs.google.com ends with .docs.google.com, not .google.com or google.com
+    // Our check is: hostname === d OR hostname.endsWith('.' + d)
+    // 'evil.docs.google.com'.endsWith('.docs.google.com') is true → allowed!
+    // This is actually by design: subdomain of an allowed domain is allowed.
+    // The real attack to test is a hostname that embeds the domain as a suffix
+    // of a different label: evildocs.google.com should NOT match docs.google.com
+    const result = validateAllowedUrl('https://evildocs.google.com/steal', domains)
+    expect(result).not.toBeNull()
+  })
+
+  test('rejects invalid URL', () => {
+    const result = validateAllowedUrl('not-a-url', domains)
+    expect(result).not.toBeNull()
+    expect(result).toContain('Invalid URL')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// convertGoogleDocsUrl()
+// ---------------------------------------------------------------------------
+
+describe('convertGoogleDocsUrl', () => {
+  test('extracts doc ID and builds export URL', () => {
+    const input = 'https://docs.google.com/document/d/1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgVE2upms/edit'
+    const result = convertGoogleDocsUrl(input)
+    expect(result).toBe(
+      'https://docs.google.com/document/d/1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgVE2upms/export?format=txt',
+    )
+  })
+
+  test('returns null for non-doc URL', () => {
+    expect(convertGoogleDocsUrl('https://docs.google.com/spreadsheets/d/abc/edit')).toBeNull()
+    expect(convertGoogleDocsUrl('https://example.com/something')).toBeNull()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// detectGoogleAuthWall()
+// ---------------------------------------------------------------------------
+
+describe('detectGoogleAuthWall', () => {
+  test('detects accounts.google.com login page', () => {
+    const html = '<html><body>Redirecting to <a href="https://accounts.google.com/ServiceLogin">Sign in</a></body></html>'
+    expect(detectGoogleAuthWall(html)).toBe(true)
+  })
+
+  test('detects ServiceLogin string', () => {
+    expect(detectGoogleAuthWall('please ServiceLogin to continue')).toBe(true)
+  })
+
+  test('passes through normal doc content', () => {
+    expect(detectGoogleAuthWall('This is the actual document content. Nothing suspicious here.')).toBe(false)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// extractConfluencePageId()
+// ---------------------------------------------------------------------------
+
+describe('extractConfluencePageId', () => {
+  test('extracts numeric ID from URL', () => {
+    expect(
+      extractConfluencePageId('https://varsity.atlassian.net/wiki/spaces/ENG/pages/123456789/Some+Page'),
+    ).toBe('123456789')
+  })
+
+  test('returns null for non-page URL', () => {
+    expect(extractConfluencePageId('https://varsity.atlassian.net/wiki/spaces/ENG/')).toBeNull()
+    expect(extractConfluencePageId('https://example.com/document')).toBeNull()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// parseLookerEnv()
+// ---------------------------------------------------------------------------
+
+describe('parseLookerEnv', () => {
+  test('extracts all three credentials', () => {
+    const content = [
+      'SLACK_BOT_TOKEN=xoxb-abc',
+      'LOOKER_BASE_URL=https://my.looker.com',
+      'LOOKER_CLIENT_ID=myclientid',
+      'LOOKER_CLIENT_SECRET=mysecret',
+    ].join('\n')
+    const result = parseLookerEnv(content)
+    expect(result).toEqual({
+      baseUrl: 'https://my.looker.com',
+      clientId: 'myclientid',
+      clientSecret: 'mysecret',
+    })
+  })
+
+  test('returns null when credentials missing', () => {
+    const content = 'SLACK_BOT_TOKEN=xoxb-abc\nLOOKER_BASE_URL=https://my.looker.com'
+    expect(parseLookerEnv(content)).toBeNull()
   })
 })

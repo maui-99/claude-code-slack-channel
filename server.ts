@@ -41,6 +41,12 @@ import {
   sanitizeDisplayName,
   gate as libGate,
   ReliableNotifier,
+  parseLookerEnv,
+  buildLookerApiUrl,
+  validateAllowedUrl,
+  convertGoogleDocsUrl,
+  extractConfluencePageId,
+  detectGoogleAuthWall,
   type Access,
   type GateResult,
 } from './lib.ts'
@@ -680,15 +686,12 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       // Load Looker credentials from the Slack .env (same file as Slack tokens)
       const envContent = readFileSync(join(homedir(), '.claude', 'channels', 'slack', '.env'), 'utf-8')
-      const envVars: Record<string, string> = {}
-      for (const line of envContent.split('\n')) {
-        const match = line.match(/^([A-Z_]+)=(.*)$/)
-        if (match) envVars[match[1]] = match[2].trim()
-      }
+      const lookerCreds = parseLookerEnv(envContent)
 
-      const lookerBase = envVars['LOOKER_BASE_URL'] || process.env['LOOKER_BASE_URL']
-      const lookerClientId = envVars['LOOKER_CLIENT_ID'] || process.env['LOOKER_CLIENT_ID']
-      const lookerClientSecret = envVars['LOOKER_CLIENT_SECRET'] || process.env['LOOKER_CLIENT_SECRET']
+      // Also check process.env fallback
+      const lookerBase = lookerCreds?.baseUrl || process.env['LOOKER_BASE_URL']
+      const lookerClientId = lookerCreds?.clientId || process.env['LOOKER_CLIENT_ID']
+      const lookerClientSecret = lookerCreds?.clientSecret || process.env['LOOKER_CLIENT_SECRET']
 
       if (!lookerBase || !lookerClientId || !lookerClientSecret) {
         return { content: [{ type: 'text', text: 'Looker API credentials not configured. Need LOOKER_BASE_URL, LOOKER_CLIENT_ID, LOOKER_CLIENT_SECRET in .env' }], isError: true }
@@ -708,23 +711,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
         if (!token) throw new Error('Looker auth returned no access_token')
 
         let apiUrl: string
-        switch (action) {
-          case 'explore': {
-            // Explore ID format: "model_name/explore_name" or just "explore_name"
-            // API requires: /lookml_models/{model}/explores/{explore}
-            const parts = id.includes('/') ? id.split('/') : ['', id]
-            if (parts.length === 2 && parts[0]) {
-              apiUrl = `${lookerBase}/api/4.0/lookml_models/${encodeURIComponent(parts[0])}/explores/${encodeURIComponent(parts[1])}`
-            } else {
-              // If no model specified, search all models
-              apiUrl = `${lookerBase}/api/4.0/lookml_models?fields=name,explores`
-            }
-            break
-          }
-          case 'look': apiUrl = `${lookerBase}/api/4.0/looks/${encodeURIComponent(id)}`; break
-          case 'dashboard': apiUrl = `${lookerBase}/api/4.0/dashboards/${encodeURIComponent(id)}`; break
-          case 'sql_runner': apiUrl = `${lookerBase}/api/4.0/sql_queries/${encodeURIComponent(id)}`; break
-          default: return { content: [{ type: 'text', text: `Unknown Looker action: ${action}` }], isError: true }
+        try {
+          apiUrl = buildLookerApiUrl(lookerBase, action, id)
+        } catch (err: any) {
+          return { content: [{ type: 'text', text: err.message }], isError: true }
         }
 
         const res = await fetch(apiUrl, { headers: { Authorization: `Bearer ${token}` }, redirect: 'manual', signal: AbortSignal.timeout(15_000) })
@@ -748,31 +738,27 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       // Domain allowlist — only these are permitted
       const ALLOWED_DOMAINS = ['docs.google.com', 'varsity.atlassian.net']
-      let parsedUrl: URL
-      try {
-        parsedUrl = new URL(url)
-      } catch {
-        return { content: [{ type: 'text', text: 'Invalid URL format.' }], isError: true }
+
+      const urlError = validateAllowedUrl(url, ALLOWED_DOMAINS)
+      if (urlError) {
+        return { content: [{ type: 'text', text: urlError }], isError: true }
       }
 
-      if (!ALLOWED_DOMAINS.some(d => parsedUrl.hostname === d || parsedUrl.hostname.endsWith('.' + d))) {
-        return { content: [{ type: 'text', text: `Domain not allowed. Only ${ALLOWED_DOMAINS.join(', ')} are permitted.` }], isError: true }
-      }
+      // Safe to parse — validateAllowedUrl already confirmed URL is valid
+      const parsedUrl = new URL(url)
 
       try {
         // For Google Docs, convert to export URL for plain text
         let fetchUrl = url
-        if (parsedUrl.hostname === 'docs.google.com' && url.includes('/document/d/')) {
-          const docIdMatch = url.match(/\/document\/d\/([a-zA-Z0-9_-]+)/)
-          if (docIdMatch) {
-            fetchUrl = `https://docs.google.com/document/d/${docIdMatch[1]}/export?format=txt`
-          }
+        if (parsedUrl.hostname === 'docs.google.com') {
+          const exportUrl = convertGoogleDocsUrl(url)
+          if (exportUrl) fetchUrl = exportUrl
         }
 
         // For Confluence, use the REST API if we have credentials
-        if (parsedUrl.hostname === 'varsity.atlassian.net' && url.includes('/pages/')) {
-          const pageIdMatch = url.match(/\/pages\/(\d+)/)
-          if (pageIdMatch) {
+        if (parsedUrl.hostname === 'varsity.atlassian.net') {
+          const pageId = extractConfluencePageId(url)
+          if (pageId) {
             // Try to load Atlassian creds from the project .env
             const projectEnv = join(homedir(), 'Downloads', 'analytic-trace-lineage-2', '.env')
             try {
@@ -785,7 +771,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
               if (atlEmail && atlToken) {
                 const auth = Buffer.from(`${atlEmail}:${atlToken}`).toString('base64')
                 const confRes = await fetch(
-                  `https://varsity.atlassian.net/wiki/rest/api/content/${pageIdMatch[1]}?expand=body.storage`,
+                  `https://varsity.atlassian.net/wiki/rest/api/content/${pageId}?expand=body.storage`,
                   { headers: { Authorization: `Basic ${auth}`, Accept: 'application/json' }, redirect: 'manual' }
                 )
                 if (confRes.ok) {
@@ -802,13 +788,14 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
         if (res.status >= 300 && res.status < 400) {
           const location = res.headers.get('location') || ''
           // Re-validate redirect target against allowlist
-          try {
-            const redirectHost = new URL(location).hostname
-            if (!ALLOWED_DOMAINS.some(d => redirectHost === d || redirectHost.endsWith('.' + d))) {
+          const redirectError = validateAllowedUrl(location, ALLOWED_DOMAINS)
+          if (redirectError) {
+            try {
+              const redirectHost = new URL(location).hostname
               return { content: [{ type: 'text', text: `Redirect to ${redirectHost} blocked — not in allowlist.` }], isError: true }
+            } catch {
+              return { content: [{ type: 'text', text: 'Invalid redirect URL.' }], isError: true }
             }
-          } catch {
-            return { content: [{ type: 'text', text: 'Invalid redirect URL.' }], isError: true }
           }
           // Follow the validated redirect manually
           const res2 = await fetch(location, { redirect: 'manual' })
@@ -821,7 +808,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
         if (contentLength > 500_000) throw new Error(`Response too large: ${contentLength} bytes`)
         const text = await res.text()
         // Detect Google Docs auth wall (returns HTML login page instead of doc content)
-        if (parsedUrl.hostname === 'docs.google.com' && (text.includes('accounts.google.com') || text.includes('ServiceLogin'))) {
+        if (parsedUrl.hostname === 'docs.google.com' && detectGoogleAuthWall(text)) {
           return { content: [{ type: 'text', text: 'This Google Doc requires authentication. It may be restricted to the organization. Please either share it with "Anyone with the link" or paste the content directly.' }], isError: true }
         }
         return { content: [{ type: 'text', text: text.slice(0, 8000) }] }

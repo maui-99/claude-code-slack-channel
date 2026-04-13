@@ -520,6 +520,86 @@ interface InFlight {
  * and log hook so it is fully testable from server.test.ts without touching
  * real timers or MCP state.
  */
+// ---------------------------------------------------------------------------
+// Looker + URL tool helpers (pure functions for testability)
+// ---------------------------------------------------------------------------
+
+/** Parse Looker credentials from .env file content */
+export function parseLookerEnv(envContent: string): { baseUrl: string; clientId: string; clientSecret: string } | null {
+  const vars: Record<string, string> = {}
+  for (const line of envContent.split('\n')) {
+    const match = line.match(/^([A-Z_]+)=(.*)$/)
+    if (match) vars[match[1]] = match[2].trim()
+  }
+  const baseUrl = vars['LOOKER_BASE_URL'] || ''
+  const clientId = vars['LOOKER_CLIENT_ID'] || ''
+  const clientSecret = vars['LOOKER_CLIENT_SECRET'] || ''
+  if (!baseUrl || !clientId || !clientSecret) return null
+  return { baseUrl, clientId, clientSecret }
+}
+
+/** Build the correct Looker API URL for a given action + id */
+export function buildLookerApiUrl(baseUrl: string, action: string, id: string): string {
+  switch (action) {
+    case 'explore': {
+      // id format: "model_name/explore_name" or just "explore_name"
+      if (id.includes('/')) {
+        const slashIdx = id.indexOf('/')
+        const model = id.slice(0, slashIdx)
+        const explore = id.slice(slashIdx + 1)
+        return `${baseUrl}/api/4.0/lookml_models/${encodeURIComponent(model)}/explores/${encodeURIComponent(explore)}`
+      }
+      // No model specified — return models listing endpoint
+      return `${baseUrl}/api/4.0/lookml_models?fields=name,explores`
+    }
+    case 'look':
+      return `${baseUrl}/api/4.0/looks/${encodeURIComponent(id)}`
+    case 'dashboard':
+      return `${baseUrl}/api/4.0/dashboards/${encodeURIComponent(id)}`
+    case 'sql_runner':
+      return `${baseUrl}/api/4.0/sql_queries/${encodeURIComponent(id)}`
+    default:
+      throw new Error(`Unknown Looker action: ${action}`)
+  }
+}
+
+/** Validate a URL against a domain allowlist. Returns null if valid, error message if not. */
+export function validateAllowedUrl(url: string, allowedDomains: string[]): string | null {
+  let parsed: URL
+  try {
+    parsed = new URL(url)
+  } catch {
+    return 'Invalid URL format.'
+  }
+  const hostname = parsed.hostname
+  const allowed = allowedDomains.some(
+    (d) => hostname === d || hostname.endsWith('.' + d),
+  )
+  if (!allowed) {
+    return `Domain not allowed. Only ${allowedDomains.join(', ')} are permitted.`
+  }
+  return null
+}
+
+/** Convert a Google Docs URL to a plain-text export URL. Returns null if not a Google Doc. */
+export function convertGoogleDocsUrl(url: string): string | null {
+  const match = url.match(/\/document\/d\/([a-zA-Z0-9_-]+)/)
+  if (!match) return null
+  return `https://docs.google.com/document/d/${match[1]}/export?format=txt`
+}
+
+/** Extract a Confluence page ID from a URL. Returns null if not a Confluence page URL. */
+export function extractConfluencePageId(url: string): string | null {
+  const match = url.match(/\/pages\/(\d+)/)
+  if (!match) return null
+  return match[1]
+}
+
+/** Detect if HTML content is a Google auth login wall instead of actual doc content */
+export function detectGoogleAuthWall(html: string): boolean {
+  return html.includes('accounts.google.com') || html.includes('ServiceLogin')
+}
+
 export class ReliableNotifier {
   private readonly scheduler: ReliableScheduler
   private readonly log: (msg: string) => void
