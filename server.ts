@@ -428,6 +428,38 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
         required: ['chat_id', 'message_id'],
       },
     },
+    {
+      name: 'read_looker',
+      description:
+        'Read Looker explore metadata, look SQL, or dashboard info via the Looker API. Requires LOOKER_BASE_URL, LOOKER_CLIENT_ID, LOOKER_CLIENT_SECRET in the Slack .env file.',
+      inputSchema: {
+        type: 'object' as const,
+        properties: {
+          action: {
+            type: 'string',
+            enum: ['explore', 'look', 'dashboard', 'sql_runner'],
+            description: 'What to read: explore metadata, look SQL, dashboard info, or run inline SQL',
+          },
+          id: {
+            type: 'string',
+            description: 'Explore name (model/explore), Look ID (numeric), or Dashboard ID (numeric)',
+          },
+        },
+        required: ['action', 'id'],
+      },
+    },
+    {
+      name: 'fetch_url',
+      description:
+        'Fetch content from a URL. SCOPED: only allows Google Docs (docs.google.com) and Confluence (varsity.atlassian.net) URLs. All other domains are rejected.',
+      inputSchema: {
+        type: 'object' as const,
+        properties: {
+          url: { type: 'string', description: 'URL to fetch (Google Docs or Confluence only)' },
+        },
+        required: ['url'],
+      },
+    },
   ],
 }))
 
@@ -636,6 +668,126 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
               : 'Failed to download any files.',
           },
         ],
+      }
+    }
+
+    // -----------------------------------------------------------------------
+    // read_looker — Looker API integration
+    // -----------------------------------------------------------------------
+    case 'read_looker': {
+      const action = args.action as string
+      const id = args.id as string
+
+      // Load Looker credentials from the Slack .env (same file as Slack tokens)
+      const envContent = readFileSync(join(homedir(), '.claude', 'channels', 'slack', '.env'), 'utf-8')
+      const envVars: Record<string, string> = {}
+      for (const line of envContent.split('\n')) {
+        const match = line.match(/^([A-Z_]+)=(.*)$/)
+        if (match) envVars[match[1]] = match[2].trim()
+      }
+
+      const lookerBase = envVars['LOOKER_BASE_URL'] || process.env['LOOKER_BASE_URL']
+      const lookerClientId = envVars['LOOKER_CLIENT_ID'] || process.env['LOOKER_CLIENT_ID']
+      const lookerClientSecret = envVars['LOOKER_CLIENT_SECRET'] || process.env['LOOKER_CLIENT_SECRET']
+
+      if (!lookerBase || !lookerClientId || !lookerClientSecret) {
+        return { content: [{ type: 'text', text: 'Looker API credentials not configured. Need LOOKER_BASE_URL, LOOKER_CLIENT_ID, LOOKER_CLIENT_SECRET in .env' }], isError: true }
+      }
+
+      try {
+        // Get API token
+        const tokenRes = await fetch(`${lookerBase}/api/4.0/login`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: `client_id=${encodeURIComponent(lookerClientId)}&client_secret=${encodeURIComponent(lookerClientSecret)}`,
+        })
+        if (!tokenRes.ok) throw new Error(`Looker auth failed: ${tokenRes.status}`)
+        const tokenData = await tokenRes.json() as { access_token: string }
+        const token = tokenData.access_token
+
+        let apiUrl: string
+        switch (action) {
+          case 'explore': apiUrl = `${lookerBase}/api/4.0/lookml_models/explores/${encodeURIComponent(id)}`; break
+          case 'look': apiUrl = `${lookerBase}/api/4.0/looks/${encodeURIComponent(id)}`; break
+          case 'dashboard': apiUrl = `${lookerBase}/api/4.0/dashboards/${encodeURIComponent(id)}`; break
+          case 'sql_runner': apiUrl = `${lookerBase}/api/4.0/sql_queries/${encodeURIComponent(id)}`; break
+          default: return { content: [{ type: 'text', text: `Unknown Looker action: ${action}` }], isError: true }
+        }
+
+        const res = await fetch(apiUrl, { headers: { Authorization: `Bearer ${token}` } })
+        if (!res.ok) throw new Error(`Looker API ${res.status}: ${await res.text().catch(() => 'no body')}`)
+        const data = await res.json()
+        const text = JSON.stringify(data, null, 2).slice(0, 8000) // Cap response size
+        return { content: [{ type: 'text', text: `Looker ${action} for "${id}":\n\n${text}` }] }
+      } catch (err: any) {
+        return { content: [{ type: 'text', text: `Looker API error: ${err.message}` }], isError: true }
+      }
+    }
+
+    // -----------------------------------------------------------------------
+    // fetch_url — scoped URL fetcher (Google Docs + Confluence only)
+    // -----------------------------------------------------------------------
+    case 'fetch_url': {
+      const url = args.url as string
+
+      // Domain allowlist — only these are permitted
+      const ALLOWED_DOMAINS = ['docs.google.com', 'varsity.atlassian.net']
+      let parsedUrl: URL
+      try {
+        parsedUrl = new URL(url)
+      } catch {
+        return { content: [{ type: 'text', text: 'Invalid URL format.' }], isError: true }
+      }
+
+      if (!ALLOWED_DOMAINS.some(d => parsedUrl.hostname === d || parsedUrl.hostname.endsWith('.' + d))) {
+        return { content: [{ type: 'text', text: `Domain not allowed. Only ${ALLOWED_DOMAINS.join(', ')} are permitted.` }], isError: true }
+      }
+
+      try {
+        // For Google Docs, convert to export URL for plain text
+        let fetchUrl = url
+        if (parsedUrl.hostname === 'docs.google.com' && url.includes('/document/d/')) {
+          const docIdMatch = url.match(/\/document\/d\/([a-zA-Z0-9_-]+)/)
+          if (docIdMatch) {
+            fetchUrl = `https://docs.google.com/document/d/${docIdMatch[1]}/export?format=txt`
+          }
+        }
+
+        // For Confluence, use the REST API if we have credentials
+        if (parsedUrl.hostname === 'varsity.atlassian.net' && url.includes('/pages/')) {
+          const pageIdMatch = url.match(/\/pages\/(\d+)/)
+          if (pageIdMatch) {
+            // Try to load Atlassian creds from the project .env
+            const projectEnv = join(homedir(), 'Downloads', 'analytic-trace-lineage-2', '.env')
+            try {
+              const projEnvContent = readFileSync(projectEnv, 'utf-8')
+              let atlEmail = '', atlToken = ''
+              for (const line of projEnvContent.split('\n')) {
+                if (line.startsWith('ATLASSIAN_EMAIL=')) atlEmail = line.split('=')[1].trim()
+                if (line.startsWith('ATLASSIAN_TOKEN=')) atlToken = line.split('=')[1].trim()
+              }
+              if (atlEmail && atlToken) {
+                const auth = Buffer.from(`${atlEmail}:${atlToken}`).toString('base64')
+                const confRes = await fetch(
+                  `https://varsity.atlassian.net/wiki/rest/api/content/${pageIdMatch[1]}?expand=body.storage`,
+                  { headers: { Authorization: `Basic ${auth}`, Accept: 'application/json' } }
+                )
+                if (confRes.ok) {
+                  const confData = await confRes.json() as any
+                  const body = (confData.body?.storage?.value || '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim()
+                  return { content: [{ type: 'text', text: `Confluence page "${confData.title}":\n\n${body.slice(0, 8000)}` }] }
+                }
+              }
+            } catch { /* fall through to raw fetch */ }
+          }
+        }
+
+        const res = await fetch(fetchUrl)
+        if (!res.ok) throw new Error(`HTTP ${res.status}`)
+        const text = await res.text()
+        return { content: [{ type: 'text', text: text.slice(0, 8000) }] }
+      } catch (err: any) {
+        return { content: [{ type: 'text', text: `Fetch error: ${err.message}` }], isError: true }
       }
     }
 
