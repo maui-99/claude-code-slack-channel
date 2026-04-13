@@ -714,10 +714,13 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
           default: return { content: [{ type: 'text', text: `Unknown Looker action: ${action}` }], isError: true }
         }
 
-        const res = await fetch(apiUrl, { headers: { Authorization: `Bearer ${token}` } })
-        if (!res.ok) throw new Error(`Looker API ${res.status}: ${await res.text().catch(() => 'no body')}`)
-        const data = await res.json()
-        const text = JSON.stringify(data, null, 2).slice(0, 8000) // Cap response size
+        const res = await fetch(apiUrl, { headers: { Authorization: `Bearer ${token}` }, redirect: 'manual' })
+        if (res.status >= 300 && res.status < 400) throw new Error(`Looker API redirected — not following`)
+        if (!res.ok) throw new Error(`Looker API ${res.status}`)
+        const contentLength = parseInt(res.headers.get('content-length') || '0', 10)
+        if (contentLength > 500_000) throw new Error(`Response too large: ${contentLength} bytes`)
+        const rawText = await res.text()
+        const text = rawText.slice(0, 8000)
         return { content: [{ type: 'text', text: `Looker ${action} for "${id}":\n\n${text}` }] }
       } catch (err: any) {
         return { content: [{ type: 'text', text: `Looker API error: ${err.message}` }], isError: true }
@@ -770,7 +773,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
                 const auth = Buffer.from(`${atlEmail}:${atlToken}`).toString('base64')
                 const confRes = await fetch(
                   `https://varsity.atlassian.net/wiki/rest/api/content/${pageIdMatch[1]}?expand=body.storage`,
-                  { headers: { Authorization: `Basic ${auth}`, Accept: 'application/json' } }
+                  { headers: { Authorization: `Basic ${auth}`, Accept: 'application/json' }, redirect: 'manual' }
                 )
                 if (confRes.ok) {
                   const confData = await confRes.json() as any
@@ -782,8 +785,27 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
           }
         }
 
-        const res = await fetch(fetchUrl)
+        const res = await fetch(fetchUrl, { redirect: 'manual' })
+        if (res.status >= 300 && res.status < 400) {
+          const location = res.headers.get('location') || ''
+          // Re-validate redirect target against allowlist
+          try {
+            const redirectHost = new URL(location).hostname
+            if (!ALLOWED_DOMAINS.some(d => redirectHost === d || redirectHost.endsWith('.' + d))) {
+              return { content: [{ type: 'text', text: `Redirect to ${redirectHost} blocked — not in allowlist.` }], isError: true }
+            }
+          } catch {
+            return { content: [{ type: 'text', text: 'Invalid redirect URL.' }], isError: true }
+          }
+          // Follow the validated redirect manually
+          const res2 = await fetch(location, { redirect: 'manual' })
+          if (!res2.ok) throw new Error(`HTTP ${res2.status} after redirect`)
+          const text2 = await res2.text()
+          return { content: [{ type: 'text', text: text2.slice(0, 8000) }] }
+        }
         if (!res.ok) throw new Error(`HTTP ${res.status}`)
+        const contentLength = parseInt(res.headers.get('content-length') || '0', 10)
+        if (contentLength > 500_000) throw new Error(`Response too large: ${contentLength} bytes`)
         const text = await res.text()
         return { content: [{ type: 'text', text: text.slice(0, 8000) }] }
       } catch (err: any) {
