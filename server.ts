@@ -304,8 +304,13 @@ const mcp = new Server(
 // We re-send with an 800ms backoff up to 3 attempts. Any inbound CallTool
 // request from Claude Code proves the turn loop is running and cancels all
 // pending retries (see the CallToolRequestSchema handler below).
+// Disabled: ReliableNotifier was causing 3x message delivery because the
+// 800ms retry fires before Claude's first tool call. The orphan-process
+// issue that originally required retries is fixed (claude-reap + flock in
+// launcher). Single fire-and-forget notification is now reliable.
 const reliableNotifier = new ReliableNotifier({
   log: (msg: string) => console.error(msg),
+  maxAttempts: 1,  // effectively disabled — single fire, no retry
 })
 
 // ---------------------------------------------------------------------------
